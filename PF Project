@@ -1,0 +1,369 @@
+  
+#include <raylib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define MAX_MENU_ITEMS 16
+#define MAX_CART_ITEMS 32
+#define MAX_RESTAURANTS 8
+#define SCREEN_W 1300
+#define SCREEN_H 850
+
+typedef struct MenuItem { const char* name; float price; } MenuItem;
+typedef struct Restaurant { const char* name; const char* category; MenuItem menu[MAX_MENU_ITEMS]; int menuCount; } Restaurant;
+typedef struct CartItem { const char* name; float price; int qty; } CartItem;
+typedef enum { ORDER_NONE, ORDER_PENDING, ORDER_PREPARING, ORDER_READY } OrderState;
+ 
+static Restaurant restaurants[MAX_RESTAURANTS];
+static int restaurantCount = 0;
+static CartItem cart[MAX_CART_ITEMS];
+static int cartCount = 0;
+static int qtyInput[MAX_MENU_ITEMS] = {0}; // temp qty for each menu item
+static int activeInput = -1; // which input box is active (-1 = none)
+
+  
+static int selectedCategory = 0;
+static int selectedRestaurantIndex = 0;
+static int inputHour = 12;
+static int inputDay = 1;
+static int inputMonth = 1;
+static int partySize = 1;
+
+static OrderState currentOrderState = ORDER_NONE;
+static float orderProgressTimer = 0.0f;
+static char lastOrderId[64] = "";
+
+// ------------------------------------------
+void DrawPanel(Rectangle r, const char* title, Font font)
+{
+    DrawRectangleRec(r, (Color){240,240,250,255});
+    DrawRectangleLinesEx(r, 2, DARKGRAY);
+    DrawTextEx(font, title, (Vector2){r.x + 10, r.y + 10}, 26, 1, DARKBLUE);
+}
+
+void DrawButton(Rectangle r, const char* text, bool hover, bool active, Font font)
+{
+    Color bg = active ? (Color){150,180,255,255} :
+               hover  ? (Color){210,225,255,255} :
+                        (Color){235,240,255,255};
+
+    DrawRectangleRec(r, bg);
+    DrawRectangleLinesEx(r, 1, DARKGRAY);
+
+    int tw = MeasureText(text, 20);
+    DrawTextEx(font, text,
+               (Vector2){r.x + (r.width - tw) / 2, r.y + 8},
+               22, 1, DARKBLUE);
+}
+
+void timestamp_now(char* buf, size_t n)
+{
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    strftime(buf,n,"%Y-%m-%d %H:%M:%S",&tm);
+}
+ 
+void SeedData(void)
+{
+    restaurantCount = 4;
+    restaurants[0] = (Restaurant){"Burger Express","Fast Food",
+        {{"Classic Burger",450},{"Cheese Fries",220},{"Veggie Wrap",320},{"Cold Drink",80}},4};
+    restaurants[1] = (Restaurant){"Pizza Corner","Fast Food",
+        {{"Margherita Pizza",850},{"Peppy Paneer",950},{"Garlic Bread",210},{"Soda",90}},4};
+    restaurants[2] = (Restaurant){"Desi Dhaba","Desi",
+        {{"Biryani",1200},{"Nihari",650},{"Roti",20},{"Lassi",150}},4};
+    restaurants[3] = (Restaurant){"Local Chaat","Desi",
+        {{"Samosa Chaat",180},{"Gol Gappa",120},{"Chai",70}},3};
+}
+
+// ------------------------------------------
+void AddToCart(const char* name,float price)
+{
+    for(int i=0;i<cartCount;i++){
+        if(strcmp(cart[i].name,name)==0){ cart[i].qty++; return; }
+    }
+    if(cartCount<MAX_CART_ITEMS){ cart[cartCount].name=name; cart[cartCount].price=price; cart[cartCount].qty=1; cartCount++; }
+}
+
+float CartTotal(void){ float t=0; for(int i=0;i<cartCount;i++) t+=cart[i].price*cart[i].qty; return t; }
+void ClearCart(void){ cartCount=0; }
+
+void gen_order_id(char* out,size_t n)
+{
+    time_t t=time(NULL); struct tm tm=*localtime(&t);
+    int rnd=rand()%9999;
+    snprintf(out,n,"ORD%02d%02d%02d%04d",tm.tm_year%100,tm.tm_mon+1,tm.tm_mday,rnd);
+}
+
+void RemoveFromCart(const char* name, int amount)
+{
+    for(int i = 0; i < cartCount; i++){
+        if(strcmp(cart[i].name, name) == 0){
+            cart[i].qty -= amount;
+            if(cart[i].qty <= 0){
+                // remove item completely
+                for(int j=i;j<cartCount-1;j++){
+                    cart[j] = cart[j+1];
+                }
+                cartCount--;
+            }
+            return;
+        }
+    }
+}
+
+void SaveOrderToFile(const char* id)
+{
+    FILE* f=fopen("orders.txt","a"); if(!f) return;
+    char ts[64]; timestamp_now(ts,sizeof(ts));
+    fprintf(f,"OrderID:%s\nTimestamp:%s\nRestaurant:%s\nPickupDay:%02d-%02d\nPickupTime:%02d\nPartySize:%d\nItems:\n",
+            id,ts,restaurants[selectedRestaurantIndex].name,inputDay,inputMonth,inputHour,partySize);
+    for(int i=0;i<cartCount;i++) fprintf(f," - %dx %s @ %.2f\n",cart[i].qty,cart[i].name,cart[i].price);
+    fprintf(f,"Total: %.2f\n-----------------------------\n",CartTotal());
+    fclose(f);
+}
+
+void AddToCartBulk(const char* name, float price, int amount){
+    for(int i=0;i<amount;i++) AddToCart(name, price);
+}
+
+void PlaceOrder(void)
+{
+    gen_order_id(lastOrderId,sizeof(lastOrderId));
+    SaveOrderToFile(lastOrderId);
+    currentOrderState=ORDER_PENDING;
+    orderProgressTimer=0;
+}
+ 
+int main(void)
+{
+    InitWindow(SCREEN_W,SCREEN_H,"Order Reservation Prototype");
+    SetTargetFPS(60);
+    SeedData();
+
+    // changing into a readable UI font
+    Font uiFont = LoadFontEx("resources/Roboto-Medium.ttf", 28, 0, 250);
+    SetTextureFilter(uiFont.texture, TEXTURE_FILTER_BILINEAR);
+
+    while(!WindowShouldClose())
+    {
+        Vector2 m=GetMousePosition();
+
+        // this is Keyboard Controls 
+        if(IsKeyPressed(KEY_UP)) inputDay++;
+        if(IsKeyPressed(KEY_DOWN)) inputDay--;
+        if(IsKeyPressed(KEY_LEFT)) inputMonth--;
+        if(IsKeyPressed(KEY_RIGHT)) inputMonth++;
+        if(IsKeyPressed(KEY_W)) inputHour++;
+        if(IsKeyPressed(KEY_S)) inputHour--;
+        if(IsKeyPressed(KEY_A)) partySize--;
+        if(IsKeyPressed(KEY_D)) partySize++;
+        if(partySize<1) partySize=1;
+        if(inputMonth<1) inputMonth=12; //making months into a loop
+        if(inputMonth>12) inputMonth=1; //making months into a loop
+        if(inputDay<1) inputDay=31; //making days a loop
+        if(inputDay>31) inputDay=1; //making days a loop
+        if(inputHour<0) inputHour=23; if(inputHour>23) inputHour=0;
+
+        // --- Order state progression ---
+        if(currentOrderState!=ORDER_NONE){
+            orderProgressTimer+=GetFrameTime();
+            if(orderProgressTimer>5 && currentOrderState==ORDER_PENDING){ currentOrderState=ORDER_PREPARING; orderProgressTimer=0; }
+            else if(orderProgressTimer>8 && currentOrderState==ORDER_PREPARING){ currentOrderState=ORDER_READY; orderProgressTimer=0; }
+        }
+
+        // ---------------- DRAW ----------------
+        BeginDrawing(); ClearBackground((Color){225,228,235,255});
+
+        // Panels
+        Rectangle catPanel={20,20,300,180};
+        Rectangle restPanel={20,210,300,550};
+        Rectangle menuPanel={340,20,600,700};
+        Rectangle cartPanel={960,20,320,460};   // wider than before
+        Rectangle resPanel={960,500,320,260};   // wider than before
+
+
+        DrawPanel(catPanel,"Categories",uiFont);
+        DrawPanel(restPanel,"Restaurants",uiFont);
+        DrawPanel(menuPanel,"Menu",uiFont);
+        DrawPanel(cartPanel,"Cart",uiFont);
+        DrawPanel(resPanel,"Reservation",uiFont);
+
+        // --- Category Buttons ---
+        Rectangle fastBtn={catPanel.x+25,catPanel.y+60,250,40};
+        Rectangle desiBtn={catPanel.x+25,catPanel.y+115,250,40};
+        DrawButton(fastBtn,"Fast Food",CheckCollisionPointRec(m,fastBtn),selectedCategory==0,uiFont);
+        DrawButton(desiBtn,"Desi",CheckCollisionPointRec(m,desiBtn),selectedCategory==1,uiFont);
+        if(IsMouseButtonReleased(MOUSE_LEFT_BUTTON)){
+            if(CheckCollisionPointRec(m,fastBtn)) selectedCategory=0;
+            if(CheckCollisionPointRec(m,desiBtn)) selectedCategory=1;
+        }
+
+// --- Restaurant List (filtered by category) ---
+int ry = restPanel.y + 50;
+for (int i = 0; i < restaurantCount; i++) {
+    // only show restaurants of the selected category
+    if ((selectedCategory == 0 && strcmp(restaurants[i].category,"Fast Food") != 0) ||
+        (selectedCategory == 1 && strcmp(restaurants[i].category,"Desi") != 0)) {
+        continue; // skip restaurants not in this category
+    }
+
+    Rectangle rbtn = { restPanel.x + 20, (float)ry, 260, 45 };
+    bool hover = CheckCollisionPointRec(m, rbtn);
+
+    // highlight selected restaurant
+    Color bg = (i == selectedRestaurantIndex) ? (Color){190,210,255,255} : (Color){240,244,255,255};
+
+    DrawRectangleRec(rbtn, bg);
+    DrawRectangleLinesEx(rbtn, 1, DARKGRAY);
+    DrawTextEx(uiFont, restaurants[i].name,
+               (Vector2){rbtn.x + 8, rbtn.y + 12}, 22, 1, DARKGRAY);
+
+    if (hover && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+        selectedRestaurantIndex = i;
+    }
+
+    ry += 55;
+}
+
+
+        // --- Menu Items ---
+Restaurant *R=&restaurants[selectedRestaurantIndex];
+int my=menuPanel.y+50;
+for(int i=0;i<R->menuCount;i++){
+    Rectangle card={menuPanel.x+15,my,menuPanel.width-30,75};
+    DrawRectangleRec(card,WHITE);
+    DrawRectangleLinesEx(card,2,(Color){180,180,200,255});
+
+    DrawTextEx(uiFont, R->menu[i].name, (Vector2){card.x+10,card.y+10}, 22, 1, BLACK);
+    DrawTextEx(uiFont, TextFormat("Rs %.0f",R->menu[i].price),
+               (Vector2){card.x+10,card.y+45}, 20, 1, DARKGREEN);
+
+    // --- Quantity input box ---
+    Rectangle qtyBox = { card.x + card.width - 300, card.y + 20, 60, 35 };
+    if(IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(GetMousePosition(), qtyBox)) {
+        activeInput = i;   // select this input box
+        qtyInput[i] = 0;   // reset
+    }
+
+    // Handle typing numbers
+    if(activeInput == i){
+        int key = GetCharPressed();
+        while(key > 0){
+            if(key >= '0' && key <= '9') qtyInput[i] = qtyInput[i]*10 + (key-'0');
+            key = GetCharPressed();
+        }
+        // Exit input on Enter or click outside
+        if(IsKeyPressed(KEY_ENTER) || (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !CheckCollisionPointRec(GetMousePosition(), qtyBox))){
+            activeInput = -1;
+        }
+    }
+
+    Color boxColor = (activeInput == i) ? (Color){200,230,255,255} : (Color){235,240,255,255};
+    DrawRectangleRec(qtyBox, boxColor);
+    DrawRectangleLinesEx(qtyBox, 1, DARKGRAY);
+    DrawTextEx(uiFont, TextFormat("%d", qtyInput[i]), (Vector2){qtyBox.x+10, qtyBox.y+6}, 22, 1, BLACK);
+
+    // --- Add Button ---
+    Rectangle addBtn = { card.x + card.width - 220, card.y + 20, 70, 35 };
+    bool hvAdd = CheckCollisionPointRec(GetMousePosition(), addBtn);
+    DrawButton(addBtn, "Add", hvAdd, false, uiFont);
+    if(hvAdd && IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && qtyInput[i] > 0){
+        AddToCartBulk(R->menu[i].name, R->menu[i].price, qtyInput[i]); // custom function
+        qtyInput[i] = 0; // reset
+    }
+
+    // --- Remove Button ---
+    Rectangle removeBtn = { card.x + card.width - 140, card.y + 20, 90, 35 };
+    bool hvRemove = CheckCollisionPointRec(GetMousePosition(), removeBtn);
+    DrawButton(removeBtn, "Remove", hvRemove, false, uiFont);
+    if(hvRemove && IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && qtyInput[i] > 0){
+        RemoveFromCart(R->menu[i].name, qtyInput[i]);
+        qtyInput[i] = 0;
+    }
+
+    my += 90;
+}
+
+
+        // --- Cart ---
+        int cy=cartPanel.y+60;
+        for(int i=0;i<cartCount;i++){
+            DrawTextEx(uiFont, TextFormat("%d x %s",cart[i].qty,cart[i].name),
+                       (Vector2){cartPanel.x+10,cy}, 20, 1, DARKGRAY);
+            cy+=28;
+        }
+        DrawTextEx(uiFont, TextFormat("Total: Rs %.0f",CartTotal()),
+                   (Vector2){cartPanel.x+10,cy+10}, 22, 1, DARKGREEN);
+
+        Rectangle clearBtn={cartPanel.x+10,cartPanel.y+10,300,40};
+        DrawButton(clearBtn,"Clear Cart",CheckCollisionPointRec(m,clearBtn),false,uiFont);
+        if(CheckCollisionPointRec(m,clearBtn) && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) ClearCart();
+
+        // --- Reservation/Controls Panel ---  
+Rectangle textBox = {
+    resPanel.x + 10,
+    resPanel.y + 40,
+    resPanel.width - 20,
+    resPanel.height - 100
+};
+
+char controlText[256];
+snprintf(controlText, sizeof(controlText), 
+    "Day: %d  (UP / DOWN)\n"
+    "Month: %d  (LEFT / RIGHT)\n"
+    "Hour: %02d  (W / S)\n"
+    "Party Size: %d  (A / D)\n",
+    inputDay, inputMonth, inputHour, partySize
+);
+
+// --- Increased line spacing ---
+float fontSize = 20;
+float spacing = 2;
+float lineSpacing = fontSize + 12;      // <<< change 12 → 20 → 30 for more spacing
+
+float x = textBox.x;
+float y = textBox.y;
+
+char textCopy[256];
+strcpy(textCopy, controlText);
+
+char *line = strtok(textCopy, "\n");
+while (line != NULL) {
+    DrawTextPro(uiFont, line, (Vector2){x, y},
+                (Vector2){0,0}, 0, fontSize, spacing, DARKGRAY);
+    y += lineSpacing;       // move to next line with spacing
+    line = strtok(NULL, "\n");
+}
+
+// --- Place Order Button ---
+Rectangle placeBtn = { resPanel.x + 10, resPanel.y + resPanel.height - 50, 300, 40 };
+DrawButton(placeBtn, "PLACE", CheckCollisionPointRec(m, placeBtn), false, uiFont);
+if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(m, placeBtn) && cartCount > 0)
+    PlaceOrder();
+
+
+        // --- Status Bar ---
+        DrawRectangle(0,SCREEN_H-50,SCREEN_W,50,(Color){210,210,220,255});
+        DrawRectangleLines(0,SCREEN_H-50,SCREEN_W,50,GRAY);
+        if(currentOrderState==ORDER_NONE)
+            DrawTextEx(uiFont, "No active order",
+                       (Vector2){20,SCREEN_H-40}, 22, 1, DARKGRAY);
+        else{
+            const char* st=currentOrderState==ORDER_PENDING?"PENDING":
+                            currentOrderState==ORDER_PREPARING?"PREPARING":
+                            "READY";
+
+            DrawTextEx(uiFont,
+               TextFormat("Order %s : %s",lastOrderId,st),
+               (Vector2){20,SCREEN_H-40}, 22, 1, DARKBLUE);
+        }
+
+        EndDrawing();
+    }
+
+    CloseWindow();
+    return 0;
+}
