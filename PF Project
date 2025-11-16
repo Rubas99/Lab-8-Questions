@@ -20,9 +20,16 @@ static Restaurant restaurants[MAX_RESTAURANTS];
 static int restaurantCount = 0;
 static CartItem cart[MAX_CART_ITEMS];
 static int cartCount = 0;
-static int qtyInput[MAX_MENU_ITEMS] = {0}; // temp qty for each menu item
-static int activeInput = -1; // which input box is active (-1 = none)
+static int qtyInput[MAX_MENU_ITEMS] = {0}; // temp qty for each menu item aka needed for multiple orders
+static int activeInput = -1; // which input box is active (-1 = none) aka needed for multiple orders
 
+//adding variables for name, address etc
+static bool showDetailsWindow = false;
+static char inputName[64] = "";
+static char inputAddress[128] = "";
+static char inputPhone[32] = "";
+static int activeDetailField = -1; // 0 = name, 1 = address, 2 = phone
+static char errorMsg[128] = "";
   
 static int selectedCategory = 0;
 static int selectedRestaurantIndex = 0;
@@ -114,16 +121,41 @@ void RemoveFromCart(const char* name, int amount)
     }
 }
 
-void SaveOrderToFile(const char* id)
+void SaveOrderToFile(const char* name, const char* address, const char* phone,
+                     CartItem* cart, int cartCount,
+                     int inputMonth, int inputDay, int inputHour, int partySize)
 {
-    FILE* f=fopen("orders.txt","a"); if(!f) return;
-    char ts[64]; timestamp_now(ts,sizeof(ts));
-    fprintf(f,"OrderID:%s\nTimestamp:%s\nRestaurant:%s\nPickupDay:%02d-%02d\nPickupTime:%02d\nPartySize:%d\nItems:\n",
-            id,ts,restaurants[selectedRestaurantIndex].name,inputDay,inputMonth,inputHour,partySize);
-    for(int i=0;i<cartCount;i++) fprintf(f," - %dx %s @ %.2f\n",cart[i].qty,cart[i].name,cart[i].price);
-    fprintf(f,"Total: %.2f\n-----------------------------\n",CartTotal());
+    FILE* f = fopen("orders.txt", "a");
+    if (!f) return;
+
+    char ts[64];
+    timestamp_now(ts, sizeof(ts));
+
+    fprintf(f, "OrderID:%s\n", lastOrderId);
+    fprintf(f, "Timestamp:%s\n", ts);
+    fprintf(f, "Customer Name: %s\n", name);
+    fprintf(f, "Address: %s\n", address);
+    fprintf(f, "Phone: %s\n", phone);
+    fprintf(f, "Restaurant: %s\n", restaurants[selectedRestaurantIndex].name);
+    fprintf(f, "PickupDay: %02d-%02d\n", inputDay, inputMonth);
+    fprintf(f, "PickupTime: %02d:00\n", inputHour); // no minutes
+    fprintf(f, "PartySize: %d\n", partySize);
+    fprintf(f, "Items:\n");
+
+    for (int i = 0; i < cartCount; i++)
+        fprintf(f, " - %dx %s @ %.2f = %.2f\n",
+                cart[i].qty,
+                cart[i].name,
+                cart[i].price,
+                cart[i].price * cart[i].qty);
+
+    fprintf(f, "Total: %.2f\n", CartTotal());
+    fprintf(f, "-----------------------------\n");
+
     fclose(f);
 }
+
+
 
 void AddToCartBulk(const char* name, float price, int amount){
     for(int i=0;i<amount;i++) AddToCart(name, price);
@@ -131,12 +163,18 @@ void AddToCartBulk(const char* name, float price, int amount){
 
 void PlaceOrder(void)
 {
-    gen_order_id(lastOrderId,sizeof(lastOrderId));
-    SaveOrderToFile(lastOrderId);
-    currentOrderState=ORDER_PENDING;
-    orderProgressTimer=0;
+    // do NOT create order yet — open details form
+    showDetailsWindow = true;
 }
- 
+
+// new function for draw input box
+void DrawInputBox(Rectangle r, bool active, const char* text, Font font) {
+    Color bg = active ? (Color){220,235,255,255} : (Color){245,245,250,255};
+    DrawRectangleRec(r, bg);
+    DrawRectangleLinesEx(r, 2, DARKBLUE);
+    DrawTextEx(font, text, (Vector2){r.x+8, r.y+8}, 22, 1, BLACK);
+}
+
 int main(void)
 {
     InitWindow(SCREEN_W,SCREEN_H,"Order Reservation Prototype");
@@ -314,7 +352,7 @@ char controlText[256];
 snprintf(controlText, sizeof(controlText), 
     "Day: %d  (UP / DOWN)\n"
     "Month: %d  (LEFT / RIGHT)\n"
-    "Hour: %02d  (W / S)\n"
+    "Hour [24hr]: %02d  (W / S)\n"
     "Party Size: %d  (A / D)\n",
     inputDay, inputMonth, inputHour, partySize
 );
@@ -341,8 +379,14 @@ while (line != NULL) {
 // --- Place Order Button ---
 Rectangle placeBtn = { resPanel.x + 10, resPanel.y + resPanel.height - 50, 300, 40 };
 DrawButton(placeBtn, "PLACE", CheckCollisionPointRec(m, placeBtn), false, uiFont);
-if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(m, placeBtn) && cartCount > 0)
-    PlaceOrder();
+if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(m, placeBtn)) {
+    if (cartCount == 0) {
+        strcpy(errorMsg, "Cart cannot be empty!");
+    } else {
+        PlaceOrder();
+    }
+}
+
 
 
         // --- Status Bar ---
@@ -360,6 +404,110 @@ if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(m, placeB
                TextFormat("Order %s : %s",lastOrderId,st),
                (Vector2){20,SCREEN_H-40}, 22, 1, DARKBLUE);
         }
+        // --------------------------------------------------------------
+//           ORDER DETAILS POP-UP WINDOW
+// --------------------------------------------------------------
+if (showDetailsWindow)
+{
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, (Color){0,0,0,150});
+
+    Rectangle panel = { SCREEN_W/2 - 250, SCREEN_H/2 - 220, 500, 440 };
+    DrawRectangleRec(panel, (Color){250,250,255,255});
+    DrawRectangleLinesEx(panel, 3, DARKBLUE);
+
+    DrawTextEx(uiFont, "Enter Order Details",
+               (Vector2){panel.x + 20, panel.y + 15}, 28, 1, DARKBLUE);
+
+    Rectangle nameBox    = { panel.x+30, panel.y+80, 440, 50 };
+    Rectangle addressBox = { panel.x+30, panel.y+160, 440, 50 };
+    Rectangle phoneBox   = { panel.x+30, panel.y+240, 440, 50 };
+    Rectangle confirmBtn = { panel.x+30, panel.y+320, 440, 55 };
+
+    // --- Input box clicks ---
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        Vector2 mp = GetMousePosition();
+        if (CheckCollisionPointRec(mp, nameBox)) activeDetailField = 0;
+        else if (CheckCollisionPointRec(mp, addressBox)) activeDetailField = 1;
+        else if (CheckCollisionPointRec(mp, phoneBox)) activeDetailField = 2;
+        else activeDetailField = -1;
+    }
+
+    // --- Handle typing ---
+    if (activeDetailField != -1) {
+        int key = GetCharPressed();
+        while (key > 0) {
+            if (key >= 32 && key <= 126) {
+                if (activeDetailField == 0 && strlen(inputName) < 60)
+                    inputName[strlen(inputName)] = key;
+                else if (activeDetailField == 1 && strlen(inputAddress) < 120)
+                    inputAddress[strlen(inputAddress)] = key;
+                else if (activeDetailField == 2 && strlen(inputPhone) < 30)
+                    inputPhone[strlen(inputPhone)] = key;
+            }
+            key = GetCharPressed();
+        }
+
+        if (IsKeyPressed(KEY_BACKSPACE)) {
+            if (activeDetailField == 0 && strlen(inputName) > 0)
+                inputName[strlen(inputName)-1] = '\0';
+            else if (activeDetailField == 1 && strlen(inputAddress) > 0)
+                inputAddress[strlen(inputAddress)-1] = '\0';
+            else if (activeDetailField == 2 && strlen(inputPhone) > 0)
+                inputPhone[strlen(inputPhone)-1] = '\0';
+        }
+    }
+
+    // --- Draw input fields ---
+    DrawTextEx(uiFont, "Name:",    (Vector2){nameBox.x,    nameBox.y-28}, 20, 1, DARKGRAY);
+    DrawTextEx(uiFont, "Address:", (Vector2){addressBox.x, addressBox.y-28}, 20, 1, DARKGRAY);
+    DrawTextEx(uiFont, "Phone:",   (Vector2){phoneBox.x,   phoneBox.y-28}, 20, 1, DARKGRAY);
+
+    DrawInputBox(nameBox,    activeDetailField==0, inputName,    uiFont);
+    DrawInputBox(addressBox, activeDetailField==1, inputAddress, uiFont);
+    DrawInputBox(phoneBox,   activeDetailField==2, inputPhone,   uiFont);
+
+    // --- Confirm Button ---
+    bool hov = CheckCollisionPointRec(GetMousePosition(), confirmBtn);
+    DrawButton(confirmBtn, "CONFIRM", hov, false, uiFont);
+
+    if (hov && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) 
+{
+    if (strlen(inputName) == 0 || strlen(inputAddress) == 0 || strlen(inputPhone) == 0) 
+    {
+        strcpy(errorMsg, "All fields are required!");
+    } 
+    else 
+    {
+        gen_order_id(lastOrderId, sizeof(lastOrderId));
+
+        SaveOrderToFile(
+            inputName,
+            inputAddress,
+            inputPhone,
+            cart,
+            cartCount,
+            inputMonth,
+            inputDay,
+            inputHour,
+            partySize
+        );
+
+        currentOrderState = ORDER_PENDING;
+        orderProgressTimer = 0;
+
+        inputName[0] = inputAddress[0] = inputPhone[0] = '\0';
+        errorMsg[0] = '\0';
+        cartCount = 0;
+        showDetailsWindow = false;
+    }
+}
+
+
+
+    // --- Error message ---
+    if (strlen(errorMsg) > 0)
+        DrawTextEx(uiFont, errorMsg, (Vector2){panel.x+30, panel.y+385}, 20, 1, RED);
+}
 
         EndDrawing();
     }
@@ -367,3 +515,4 @@ if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(m, placeB
     CloseWindow();
     return 0;
 }
+    
